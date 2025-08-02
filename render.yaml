@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: qr-attendance-api
+    env: python
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python qr_api.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: PIP_ONLY_BINARY
+        value: ":all:"
