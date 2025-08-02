@@ -224,15 +224,23 @@ def validate_qr():
             
         cleanup_expired_qr_codes()
         
+        # Log the raw request data for debugging
+        print(f"🔍 Raw request data: {request.data}")
+        print(f"🔍 Request headers: {dict(request.headers)}")
+        print(f"🔍 Content-Type: {request.content_type}")
+        
         # Better JSON parsing with error handling
         try:
-            data = request.get_json()
+            data = request.get_json(force=True)  # Add force=True to handle edge cases
+            print(f"🔍 Parsed JSON data: {data}")
+            
             if not data:
                 return jsonify({
                     'valid': False,
                     'message': 'No JSON data provided'
                 }), 400
         except Exception as json_error:
+            print(f"❌ JSON parsing error: {json_error}")
             return jsonify({
                 'valid': False,
                 'message': f'Invalid JSON format: {str(json_error)}'
@@ -242,16 +250,18 @@ def validate_qr():
         student_id = data.get('student_id', '').strip()
         student_name = data.get('student_name', '').strip()
         
-        print(f"🔍 Validation request: QR={qr_code}, Student={student_id}")
+        print(f"🔍 Validation request: QR='{qr_code}', Student='{student_id}', Name='{student_name}'")
         
-        # Validate input
+        # Validate input with more specific error messages
         if not qr_code:
+            print("❌ QR code is missing or empty")
             return jsonify({
                 'valid': False,
                 'message': 'QR code is required'
             }), 400
             
         if not student_id:
+            print("❌ Student ID is missing or empty")
             return jsonify({
                 'valid': False,
                 'message': 'Student ID is required'
