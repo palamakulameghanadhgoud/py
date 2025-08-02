@@ -199,7 +199,9 @@ def get_qr():
             "created_at": current_time,
             "expires_at": expires_at,
             "is_active": True,
-            "used_by": []
+            "used_by": [],
+            "session_name": f"Session_{current_time.strftime('%H%M%S')}",
+            "created_by": request.remote_addr or 'Unknown'
         }
         
         result = qr_sessions_collection.insert_one(qr_session)
@@ -212,7 +214,8 @@ def get_qr():
             "timestamp": current_time.isoformat(),
             "expires_at": expires_at.isoformat(),
             "expires_in": QR_VALIDITY_SECONDS,
-            "session_id": str(result.inserted_id)
+            "session_id": str(result.inserted_id),
+            "session_name": qr_session["session_name"]
         })
         
     except Exception as e:
@@ -481,68 +484,272 @@ def download_excel():
             'message': 'Failed to generate Excel report'
         }), 500
 
-@app.route('/debug/database')
-def debug_database():
-    """Debug endpoint to check database status"""
+@app.route('/download/session/<session_id>')
+def download_session_excel(session_id):
+    """Download attendance report for a specific QR session"""
     try:
         if not client:
-            return jsonify({
-                'database_connected': False,
-                'error': 'MongoDB client not initialized'
-            }), 500
+            return jsonify({'error': 'Database not connected'}), 500
             
-        # Test database connection
-        client.admin.command('ping')
+        # Find the QR session
+        try:
+            qr_session = qr_sessions_collection.find_one({"_id": ObjectId(session_id)})
+        except:
+            return jsonify({'error': 'Invalid session ID format'}), 400
+            
+        if not qr_session:
+            return jsonify({'error': 'QR session not found'}), 404
         
-        return jsonify({
-            'database_connected': True,
-            'database_name': DATABASE_NAME,
-            'mongodb_uri': 'mongodb+srv://megh:***@vicecluster.4wafcsu.mongodb.net/',
-            'collections': {
-                'students': students_collection.count_documents({}),
-                'attendance': attendance_collection.count_documents({}),
-                'qr_sessions': qr_sessions_collection.count_documents({})
-            },
-            'active_qr_sessions': qr_sessions_collection.count_documents({
-                "expires_at": {"$gt": datetime.now()},
-                "is_active": True
-            })
-        })
+        # Get attendance records for this specific session
+        attendance_records = list(attendance_collection.find({
+            "qr_session_id": ObjectId(session_id)
+        }))
+        
+        if not attendance_records:
+            return jsonify({'error': 'No attendance records found for this session'}), 404
+        
+        # Prepare Excel data for this session only
+        excel_data = []
+        for record in attendance_records:
+            row = {
+                'Session_ID': session_id,
+                'QR_Code': record['qr_code'],
+                'Student_ID': record['student_id'],
+                'Student_Name': record['student_name'],
+                'Department': record['department'],
+                'Year': record['year'],
+                'Attendance_Time': record['marked_at'].strftime('%Y-%m-%d %H:%M:%S'),
+                'Status': 'Present',
+                'IP_Address': record.get('ip_address', ''),
+                'User_Agent': record.get('user_agent', '')[:50] + '...' if len(record.get('user_agent', '')) > 50 else record.get('user_agent', '')
+            }
+            excel_data.append(row)
+        
+        # Create DataFrame and Excel file
+        df = pd.DataFrame(excel_data)
+        
+        # Create Excel file in memory
+        excel_buffer = BytesIO()
+        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name=f'Session {session_id[:8]}', index=False)
+            
+            # Add summary sheet
+            summary_data = [{
+                'Session_ID': session_id,
+                'QR_Code': qr_session['qr_code'],
+                'Session_Created': qr_session['created_at'].strftime('%Y-%m-%d %H:%M:%S'),
+                'Session_Expired': qr_session['expires_at'].strftime('%Y-%m-%d %H:%M:%S'),
+                'Total_Attendees': len(attendance_records),
+                'Students_Present': ', '.join([r['student_id'] for r in attendance_records])
+            }]
+            summary_df = pd.DataFrame(summary_data)
+            summary_df.to_excel(writer, sheet_name='Session Summary', index=False)
+        
+        excel_buffer.seek(0)
+        
+        # Generate unique filename with timestamp
+        session_time = qr_session['created_at'].strftime('%Y%m%d_%H%M%S')
+        filename = f"Attendance_Session_{session_time}_{session_id[:8]}.xlsx"
+        
+        return send_file(
+            excel_buffer,
+            as_attachment=True,
+            download_name=filename,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        
     except Exception as e:
-        print(f"❌ Database debug error: {e}")
+        print(f"❌ Error in download_session_excel: {e}")
         return jsonify({
-            'database_connected': False,
-            'error': str(e)
+            'error': str(e),
+            'message': 'Failed to generate session Excel report'
         }), 500
 
-@app.route('/debug/network')
-def debug_network():
-    """Network debugging endpoint"""
-    import socket
-    
-    # Get actual server network info
-    hostname = socket.gethostname()
+@app.route('/download/latest-session')
+def download_latest_session():
+    """Download attendance report for the most recent QR session with attendees"""
     try:
-        # Get local IP
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-    except:
-        local_ip = "Unable to determine"
-    
-    return jsonify({
-        'message': 'Network connection working!',
-        'server_hostname': hostname,
-        'server_local_ip': local_ip,
-        'client_ip': request.remote_addr,
-        'user_agent': request.headers.get('User-Agent', ''),
-        'timestamp': datetime.now().isoformat(),
-        'api_accessible': True,
-        'cors_enabled': True,
-        'mongodb_connected': client is not None,
-        'environment': os.getenv('RENDER', 'local')
-    })
+        if not client:
+            return jsonify({'error': 'Database not connected'}), 500
+        
+        # Find the most recent session that has attendance records
+        latest_attendance = attendance_collection.find().sort("marked_at", -1).limit(1)
+        latest_record = list(latest_attendance)
+        
+        if not latest_record:
+            return jsonify({'error': 'No attendance records found'}), 404
+        
+        session_id = str(latest_record[0]['qr_session_id'])
+        
+        # Redirect to session-specific download
+        from flask import redirect, url_for
+        return redirect(url_for('download_session_excel', session_id=session_id))
+        
+    except Exception as e:
+        print(f"❌ Error in download_latest_session: {e}")
+        return jsonify({
+            'error': str(e),
+            'message': 'Failed to find latest session'
+        }), 500
+
+@app.route('/sessions/active')
+def get_active_sessions():
+    """Get list of active QR sessions with attendance counts"""
+    try:
+        if not client:
+            return jsonify({'error': 'Database not connected'}), 500
+        
+        # Get all sessions from today
+        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end = today_start + timedelta(days=1)
+        
+        sessions = list(qr_sessions_collection.find({
+            "created_at": {"$gte": today_start, "$lt": today_end}
+        }).sort("created_at", -1))
+        
+        session_data = []
+        for session in sessions:
+            # Count attendance for this session
+            attendance_count = attendance_collection.count_documents({
+                "qr_session_id": session['_id']
+            })
+            
+            # Get attendee list
+            attendees = list(attendance_collection.find({
+                "qr_session_id": session['_id']
+            }, {"student_id": 1, "student_name": 1, "marked_at": 1}))
+            
+            session_info = {
+                'session_id': str(session['_id']),
+                'qr_code': session['qr_code'],
+                'created_at': session['created_at'].isoformat(),
+                'expires_at': session['expires_at'].isoformat(),
+                'is_expired': session['expires_at'] < datetime.now(),
+                'attendance_count': attendance_count,
+                'attendees': [{'student_id': a['student_id'], 'student_name': a['student_name'], 'marked_at': a['marked_at'].isoformat()} for a in attendees],
+                'download_url': f"/download/session/{str(session['_id'])}"
+            }
+            session_data.append(session_info)
+        
+        return jsonify({
+            'sessions': session_data,
+            'total_sessions': len(session_data),
+            'total_attendees_today': sum(s['attendance_count'] for s in session_data)
+        })
+        
+    except Exception as e:
+        print(f"❌ Error in get_active_sessions: {e}")
+        return jsonify({
+            'error': str(e),
+            'message': 'Failed to fetch sessions'
+        }), 500
+
+@app.route('/sessions/by-date/<date>')
+def get_sessions_by_date(date):
+    """Get sessions for a specific date"""
+    try:
+        if not client:
+            return jsonify({'error': 'Database not connected'}), 500
+        
+        # Parse date
+        try:
+            target_date = datetime.strptime(date, '%Y-%m-%d')
+            start_date = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_date = start_date + timedelta(days=1)
+        except ValueError:
+            return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD'}), 400
+        
+        sessions = list(qr_sessions_collection.find({
+            "created_at": {"$gte": start_date, "$lt": end_date}
+        }).sort("created_at", -1))
+        
+        session_data = []
+        for session in sessions:
+            attendance_count = attendance_collection.count_documents({
+                "qr_session_id": session['_id']
+            })
+            
+            attendees = list(attendance_collection.find({
+                "qr_session_id": session['_id']
+            }, {"student_id": 1, "student_name": 1, "marked_at": 1}))
+            
+            session_info = {
+                'session_id': str(session['_id']),
+                'qr_code': session['qr_code'],
+                'created_at': session['created_at'].isoformat(),
+                'expires_at': session['expires_at'].isoformat(),
+                'is_expired': session['expires_at'] < datetime.now(),
+                'attendance_count': attendance_count,
+                'attendees': [{'student_id': a['student_id'], 'student_name': a['student_name'], 'marked_at': a['marked_at'].isoformat()} for a in attendees],
+                'download_url': f"/download/session/{str(session['_id'])}"
+            }
+            session_data.append(session_info)
+        
+        return jsonify({
+            'date': date,
+            'sessions': session_data,
+            'total_sessions': len(session_data),
+            'total_attendees': sum(s['attendance_count'] for s in session_data)
+        })
+        
+    except Exception as e:
+        print(f"❌ Error in get_sessions_by_date: {e}")
+        return jsonify({
+            'error': str(e),
+            'message': 'Failed to fetch sessions for date'
+        }), 500
+
+@app.route('/sessions/stats')
+def get_session_stats():
+    """Get overall session statistics"""
+    try:
+        if not client:
+            return jsonify({'error': 'Database not connected'}), 500
+        
+        # Get today's stats
+        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end = today_start + timedelta(days=1)
+        
+        today_sessions = qr_sessions_collection.count_documents({
+            "created_at": {"$gte": today_start, "$lt": today_end}
+        })
+        
+        today_attendance = attendance_collection.count_documents({
+            "session_date": today_start
+        })
+        
+        # Get total stats
+        total_sessions = qr_sessions_collection.count_documents({})
+        total_attendance = attendance_collection.count_documents({})
+        total_students = students_collection.count_documents({})
+        
+        # Get active sessions
+        active_sessions = qr_sessions_collection.count_documents({
+            "expires_at": {"$gt": datetime.now()},
+            "is_active": True
+        })
+        
+        return jsonify({
+            'today': {
+                'sessions': today_sessions,
+                'attendance': today_attendance,
+                'attendance_rate': f"{(today_attendance/total_students*100):.1f}%" if total_students > 0 else "0%"
+            },
+            'total': {
+                'sessions': total_sessions,
+                'attendance_records': total_attendance,
+                'students': total_students
+            },
+            'active_sessions': active_sessions,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        print(f"❌ Error in get_session_stats: {e}")
+        return jsonify({
+            'error': str(e),
+            'message': 'Failed to fetch session statistics'
+        }), 500
 
 if __name__ == '__main__':
     print("🚀 Starting Flask API with MongoDB Atlas...")
