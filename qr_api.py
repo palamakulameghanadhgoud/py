@@ -144,20 +144,48 @@ def generate_qr_image(data):
         return None
 
 def cleanup_expired_qr_codes():
-    """Remove expired QR codes from MongoDB"""
+    """Legacy function - now calls the enhanced cleanup"""
+    return cleanup_expired_sessions_and_data()
+
+def cleanup_expired_sessions_and_data():
+    """Automatically remove expired sessions AND their attendance data from MongoDB"""
     try:
         if not client:
             return 0
             
         current_time = datetime.now()
-        result = qr_sessions_collection.delete_many({
+        
+        # Find all expired sessions
+        expired_sessions = list(qr_sessions_collection.find({
             "expires_at": {"$lt": current_time}
+        }))
+        
+        if not expired_sessions:
+            return 0
+        
+        expired_session_ids = [session['_id'] for session in expired_sessions]
+        expired_qr_codes = [session['qr_code'] for session in expired_sessions]
+        
+        # Delete attendance records for expired sessions
+        attendance_delete_result = attendance_collection.delete_many({
+            "qr_session_id": {"$in": expired_session_ids}
         })
-        if result.deleted_count > 0:
-            print(f"🧹 Cleaned up {result.deleted_count} expired QR codes")
-        return result.deleted_count
+        
+        # Delete the expired QR sessions
+        sessions_delete_result = qr_sessions_collection.delete_many({
+            "_id": {"$in": expired_session_ids}
+        })
+        
+        if sessions_delete_result.deleted_count > 0 or attendance_delete_result.deleted_count > 0:
+            print(f"🗑️ AUTO-DELETED EXPIRED DATA:")
+            print(f"   📱 Deleted {sessions_delete_result.deleted_count} expired QR sessions")
+            print(f"   📊 Deleted {attendance_delete_result.deleted_count} attendance records")
+            print(f"   🔗 QR codes auto-deleted: {expired_qr_codes}")
+        
+        return sessions_delete_result.deleted_count
+        
     except Exception as e:
-        print(f"❌ Error cleaning up QR codes: {e}")
+        print(f"❌ Error in auto-cleanup: {e}")
         return 0
 
 # Health check endpoint for Render
@@ -181,7 +209,8 @@ def get_qr():
         if not client:
             return jsonify({"error": "Database not connected"}), 500
             
-        cleanup_expired_qr_codes()
+        # Automatically clean up expired sessions and their data when generating new QR
+        cleanup_expired_sessions_and_data()
         
         # Generate QR data
         qr_data = generate_random_data()
@@ -201,12 +230,14 @@ def get_qr():
             "is_active": True,
             "used_by": [],
             "session_name": f"Session_{current_time.strftime('%H%M%S')}",
-            "created_by": request.remote_addr or 'Unknown'
+            "created_by": request.remote_addr or 'Unknown',
+            "auto_delete_on_expire": True  # Mark for automatic deletion
         }
         
         result = qr_sessions_collection.insert_one(qr_session)
         
         print(f"📱 Generated QR code: {qr_data} (expires at {expires_at})")
+        print(f"🗑️ Previous expired sessions auto-deleted")
         
         return jsonify({
             "data": qr_data,
@@ -215,7 +246,8 @@ def get_qr():
             "expires_at": expires_at.isoformat(),
             "expires_in": QR_VALIDITY_SECONDS,
             "session_id": str(result.inserted_id),
-            "session_name": qr_session["session_name"]
+            "session_name": qr_session["session_name"],
+            "auto_cleanup": True
         })
         
     except Exception as e:
@@ -486,10 +518,14 @@ def download_excel():
 
 @app.route('/download/session/<session_id>')
 def download_session_excel(session_id):
-    """Download attendance report for a specific QR session"""
+    """Download attendance report for a specific QR session - triggers auto cleanup"""
     try:
         if not client:
             return jsonify({'error': 'Database not connected'}), 500
+        
+        # AUTO-CLEANUP: Remove expired sessions when downloading
+        print("🗑️ Performing auto-cleanup during download...")
+        cleanup_expired_sessions_and_data()
             
         # Find the QR session
         try:
@@ -540,7 +576,9 @@ def download_session_excel(session_id):
                 'Session_Created': qr_session['created_at'].strftime('%Y-%m-%d %H:%M:%S'),
                 'Session_Expired': qr_session['expires_at'].strftime('%Y-%m-%d %H:%M:%S'),
                 'Total_Attendees': len(attendance_records),
-                'Students_Present': ', '.join([r['student_id'] for r in attendance_records])
+                'Students_Present': ', '.join([r['student_id'] for r in attendance_records]),
+                'Download_Time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'Auto_Cleanup_Performed': 'Yes'
             }]
             summary_df = pd.DataFrame(summary_data)
             summary_df.to_excel(writer, sheet_name='Session Summary', index=False)
@@ -550,6 +588,9 @@ def download_session_excel(session_id):
         # Generate unique filename with timestamp
         session_time = qr_session['created_at'].strftime('%Y%m%d_%H%M%S')
         filename = f"Attendance_Session_{session_time}_{session_id[:8]}.xlsx"
+        
+        print(f"📊 Session download complete: {filename}")
+        print(f"🗑️ Expired data automatically cleaned up")
         
         return send_file(
             excel_buffer,
@@ -567,10 +608,14 @@ def download_session_excel(session_id):
 
 @app.route('/download/latest-session')
 def download_latest_session():
-    """Download attendance report for the most recent QR session with attendees"""
+    """Download attendance report for the most recent QR session - triggers auto cleanup"""
     try:
         if not client:
             return jsonify({'error': 'Database not connected'}), 500
+        
+        # AUTO-CLEANUP: Remove expired sessions when downloading latest
+        print("🗑️ Performing auto-cleanup during latest download...")
+        cleanup_expired_sessions_and_data()
         
         # Find the most recent session that has attendance records
         latest_attendance = attendance_collection.find().sort("marked_at", -1).limit(1)
