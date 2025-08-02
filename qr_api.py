@@ -19,19 +19,29 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# CORS Configuration for production deployment
+# CORS Configuration - More permissive for Vercel
 CORS(app, 
-     origins=["*"],
+     origins=["*"],  # Allow all origins
      methods=["GET", "POST", "OPTIONS", "PUT", "DELETE"],
-     allow_headers=["Content-Type", "Authorization"],
-     supports_credentials=True
+     allow_headers=["*"],  # Allow all headers
+     supports_credentials=False,  # Change to False for broader compatibility
+     expose_headers=["*"]  # Expose all headers
 )
 
 @app.after_request
 def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    # Remove restrictive CORS headers and make them more permissive
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = '*'
+    response.headers['Access-Control-Allow-Credentials'] = 'false'
+    response.headers['Access-Control-Max-Age'] = '86400'
+    
+    # Remove any caching that might interfere
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    
     return response
 
 # Configuration from environment variables
@@ -224,23 +234,15 @@ def validate_qr():
             
         cleanup_expired_qr_codes()
         
-        # Log the raw request data for debugging
-        print(f"🔍 Raw request data: {request.data}")
-        print(f"🔍 Request headers: {dict(request.headers)}")
-        print(f"🔍 Content-Type: {request.content_type}")
-        
         # Better JSON parsing with error handling
         try:
-            data = request.get_json(force=True)  # Add force=True to handle edge cases
-            print(f"🔍 Parsed JSON data: {data}")
-            
+            data = request.get_json()
             if not data:
                 return jsonify({
                     'valid': False,
                     'message': 'No JSON data provided'
                 }), 400
         except Exception as json_error:
-            print(f"❌ JSON parsing error: {json_error}")
             return jsonify({
                 'valid': False,
                 'message': f'Invalid JSON format: {str(json_error)}'
@@ -250,18 +252,16 @@ def validate_qr():
         student_id = data.get('student_id', '').strip()
         student_name = data.get('student_name', '').strip()
         
-        print(f"🔍 Validation request: QR='{qr_code}', Student='{student_id}', Name='{student_name}'")
+        print(f"🔍 Validation request: QR={qr_code}, Student={student_id}")
         
-        # Validate input with more specific error messages
+        # Validate input
         if not qr_code:
-            print("❌ QR code is missing or empty")
             return jsonify({
                 'valid': False,
                 'message': 'QR code is required'
             }), 400
             
         if not student_id:
-            print("❌ Student ID is missing or empty")
             return jsonify({
                 'valid': False,
                 'message': 'Student ID is required'
