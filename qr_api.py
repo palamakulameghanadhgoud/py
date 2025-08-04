@@ -69,7 +69,79 @@ except Exception as e:
     client = None
 
 # Configuration
-QR_VALIDITY_SECONDS = 30
+QR_VALIDITY_SECONDS = 3  # Changed from 30 to 3 seconds
+QR_AUTO_REFRESH_INTERVAL = 3  # Auto-generate new QR every 3 seconds
+
+# Global variable to track current QR session
+current_qr_session = None
+qr_generation_thread = None
+
+import threading
+import time
+
+def auto_generate_qr():
+    """Background thread to automatically generate new QR codes every 3 seconds"""
+    global current_qr_session
+    
+    while True:
+        try:
+            if not client:
+                print("❌ Database not connected, skipping auto QR generation")
+                time.sleep(QR_AUTO_REFRESH_INTERVAL)
+                continue
+            
+            # Terminate ALL previous QR sessions immediately
+            qr_sessions_collection.update_many(
+                {"is_active": True},
+                {"$set": {"is_active": False, "terminated_at": datetime.now(), "auto_terminated": True}}
+            )
+            
+            # Clean up expired sessions and their data
+            cleanup_expired_sessions_and_data()
+            
+            # Generate new QR data
+            qr_data = generate_random_data()
+            qr_image = generate_qr_image(qr_data)
+            
+            if qr_image:
+                # Store new QR session in MongoDB
+                current_time = datetime.now()
+                expires_at = current_time + timedelta(seconds=QR_VALIDITY_SECONDS)
+                
+                qr_session = {
+                    "qr_code": qr_data,
+                    "created_at": current_time,
+                    "expires_at": expires_at,
+                    "is_active": True,
+                    "used_by": [],
+                    "session_name": f"AutoSession_{current_time.strftime('%H%M%S')}",
+                    "created_by": "AUTO_GENERATOR",
+                    "auto_delete_on_expire": True,
+                    "auto_generated": True,
+                    "qr_image": qr_image
+                }
+                
+                result = qr_sessions_collection.insert_one(qr_session)
+                current_qr_session = qr_session
+                current_qr_session['_id'] = result.inserted_id
+                
+                print(f"🔄 AUTO-GENERATED QR: {qr_data} (expires in {QR_VALIDITY_SECONDS}s)")
+                print(f"🗑️ Previous QRs terminated immediately")
+            
+        except Exception as e:
+            print(f"❌ Error in auto QR generation: {e}")
+        
+        # Wait for next generation
+        time.sleep(QR_AUTO_REFRESH_INTERVAL)
+
+def start_auto_qr_generation():
+    """Start the background QR generation thread"""
+    global qr_generation_thread
+    
+    if qr_generation_thread is None or not qr_generation_thread.is_alive():
+        qr_generation_thread = threading.Thread(target=auto_generate_qr, daemon=True)
+        qr_generation_thread.start()
+        print("🚀 Auto QR generation started (every 3 seconds)")
 
 def initialize_database():
     """Initialize the database with student records"""
@@ -204,50 +276,49 @@ def health_check():
 # API Routes
 @app.route('/qr')
 def get_qr():
-    """Generate and return a new QR code"""
+    """Get the current auto-generated QR code"""
     try:
+        global current_qr_session
+        
         if not client:
             return jsonify({"error": "Database not connected"}), 500
-            
-        # Automatically clean up expired sessions and their data when generating new QR
-        cleanup_expired_sessions_and_data()
         
-        # Generate QR data
-        qr_data = generate_random_data()
-        qr_image = generate_qr_image(qr_data)
+        # Start auto-generation if not running
+        start_auto_qr_generation()
         
-        if qr_image is None:
-            return jsonify({"error": "Failed to generate QR code"}), 500
+        # If no current session, wait a moment for auto-generation
+        if not current_qr_session:
+            time.sleep(0.5)  # Brief wait for auto-generation to start
         
-        # Store QR session in MongoDB
+        # Get the most recent active QR session
+        try:
+            active_qr = qr_sessions_collection.find_one({
+                "is_active": True,
+                "expires_at": {"$gt": datetime.now()}
+            }, sort=[("created_at", -1)])
+        except Exception as db_error:
+            return jsonify({"error": f"Database error: {str(db_error)}"}), 500
+        
+        if not active_qr:
+            return jsonify({
+                "error": "No active QR code available",
+                "message": "Auto-generation starting, please try again in a moment"
+            }), 503
+        
         current_time = datetime.now()
-        expires_at = current_time + timedelta(seconds=QR_VALIDITY_SECONDS)
-        
-        qr_session = {
-            "qr_code": qr_data,
-            "created_at": current_time,
-            "expires_at": expires_at,
-            "is_active": True,
-            "used_by": [],
-            "session_name": f"Session_{current_time.strftime('%H%M%S')}",
-            "created_by": request.remote_addr or 'Unknown',
-            "auto_delete_on_expire": True  # Mark for automatic deletion
-        }
-        
-        result = qr_sessions_collection.insert_one(qr_session)
-        
-        print(f"📱 Generated QR code: {qr_data} (expires at {expires_at})")
-        print(f"🗑️ Previous expired sessions auto-deleted")
+        time_remaining = (active_qr['expires_at'] - current_time).total_seconds()
         
         return jsonify({
-            "data": qr_data,
-            "image": qr_image,
+            "data": active_qr['qr_code'],
+            "image": active_qr.get('qr_image', ''),
             "timestamp": current_time.isoformat(),
-            "expires_at": expires_at.isoformat(),
-            "expires_in": QR_VALIDITY_SECONDS,
-            "session_id": str(result.inserted_id),
-            "session_name": qr_session["session_name"],
-            "auto_cleanup": True
+            "expires_at": active_qr['expires_at'].isoformat(),
+            "expires_in": max(0, int(time_remaining)),
+            "session_id": str(active_qr['_id']),
+            "session_name": active_qr["session_name"],
+            "auto_generated": True,
+            "refresh_interval": QR_AUTO_REFRESH_INTERVAL,
+            "message": f"QR auto-refreshes every {QR_AUTO_REFRESH_INTERVAL} seconds"
         })
         
     except Exception as e:
@@ -796,6 +867,50 @@ def get_session_stats():
             'message': 'Failed to fetch session statistics'
         }), 500
 
+@app.route('/qr/status')
+def qr_status():
+    """Get current QR status and timing information"""
+    try:
+        if not client:
+            return jsonify({'error': 'Database not connected'}), 500
+        
+        current_time = datetime.now()
+        
+        # Get current active QR
+        active_qr = qr_sessions_collection.find_one({
+            "is_active": True,
+            "expires_at": {"$gt": current_time}
+        }, sort=[("created_at", -1)])
+        
+        if active_qr:
+            time_remaining = (active_qr['expires_at'] - current_time).total_seconds()
+            next_refresh = QR_AUTO_REFRESH_INTERVAL - (time_remaining % QR_AUTO_REFRESH_INTERVAL)
+            
+            return jsonify({
+                'active': True,
+                'qr_code': active_qr['qr_code'],
+                'created_at': active_qr['created_at'].isoformat(),
+                'expires_at': active_qr['expires_at'].isoformat(),
+                'time_remaining': max(0, time_remaining),
+                'next_refresh_in': max(0, next_refresh),
+                'refresh_interval': QR_AUTO_REFRESH_INTERVAL,
+                'auto_generation_active': qr_generation_thread and qr_generation_thread.is_alive(),
+                'used_by_count': len(active_qr.get('used_by', []))
+            })
+        else:
+            return jsonify({
+                'active': False,
+                'message': 'No active QR code',
+                'auto_generation_active': qr_generation_thread and qr_generation_thread.is_alive(),
+                'refresh_interval': QR_AUTO_REFRESH_INTERVAL
+            })
+        
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'message': 'Failed to get QR status'
+        }), 500
+
 if __name__ == '__main__':
     print("🚀 Starting Flask API with MongoDB Atlas...")
     
@@ -805,9 +920,16 @@ if __name__ == '__main__':
     else:
         print("❌ Database initialization failed")
     
+    # Start auto QR generation
+    start_auto_qr_generation()
+    print(f"🔄 Auto QR generation started (every {QR_AUTO_REFRESH_INTERVAL} seconds)")
+    
     print(f"🔗 MongoDB URI: mongodb+srv://megh:***@vicecluster.4wafcsu.mongodb.net/")
     print(f"📊 Database: {DATABASE_NAME}")
     print(f"🌐 Starting server on port {PORT}")
     
     # Run Flask API
     app.run(debug=False, port=PORT, host='0.0.0.0')
+
+    # Start the auto QR generation in the background
+    start_auto_qr_generation()
