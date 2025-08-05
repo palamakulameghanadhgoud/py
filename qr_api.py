@@ -333,6 +333,7 @@ def validate_qr():
         
     try:
         if not client:
+            print("❌ Database not connected")
             return jsonify({
                 'valid': False,
                 'message': 'Database not connected'
@@ -340,15 +341,23 @@ def validate_qr():
             
         cleanup_expired_qr_codes()
         
-        # Better JSON parsing with error handling
+        # Enhanced JSON parsing with detailed logging
+        print(f"📥 Raw request data: {request.data}")
+        print(f"📥 Content-Type: {request.content_type}")
+        print(f"📥 Headers: {dict(request.headers)}")
+        
         try:
-            data = request.get_json()
+            data = request.get_json(force=True)  # Force JSON parsing
+            print(f"📥 Parsed JSON data: {data}")
+            
             if not data:
+                print("❌ No JSON data provided")
                 return jsonify({
                     'valid': False,
                     'message': 'No JSON data provided'
                 }), 400
         except Exception as json_error:
+            print(f"❌ JSON parsing error: {json_error}")
             return jsonify({
                 'valid': False,
                 'message': f'Invalid JSON format: {str(json_error)}'
@@ -358,25 +367,30 @@ def validate_qr():
         student_id = data.get('student_id', '').strip()
         student_name = data.get('student_name', '').strip()
         
-        print(f"🔍 Validation request: QR={qr_code}, Student={student_id}")
+        print(f"🔍 Validation request: QR='{qr_code}', Student='{student_id}', Name='{student_name}'")
         
-        # Validate input
+        # Validate input with detailed error messages
         if not qr_code:
+            print("❌ QR code is missing or empty")
             return jsonify({
                 'valid': False,
-                'message': 'QR code is required'
+                'message': 'QR code is required and cannot be empty'
             }), 400
             
         if not student_id:
+            print("❌ Student ID is missing or empty")
             return jsonify({
                 'valid': False,
-                'message': 'Student ID is required'
+                'message': 'Student ID is required and cannot be empty'
             }), 400
         
         # Check if student exists in database
         try:
             student = students_collection.find_one({"student_id": student_id})
+            print(f"🔍 Student lookup result: {student is not None}")
+            
             if not student:
+                print(f"❌ Student ID {student_id} not found in database")
                 return jsonify({
                     'valid': False,
                     'message': f'Student ID {student_id} not found in database'
@@ -396,6 +410,8 @@ def validate_qr():
                 "expires_at": {"$gt": current_time},
                 "is_active": True
             })
+            print(f"🔍 QR session lookup result: {qr_session is not None}")
+            
         except Exception as qr_error:
             print(f"❌ Database error finding QR session: {qr_error}")
             return jsonify({
@@ -407,11 +423,13 @@ def validate_qr():
             # Check if QR exists but expired
             expired_qr = qr_sessions_collection.find_one({"qr_code": qr_code})
             if expired_qr:
+                print(f"❌ QR code {qr_code} has expired")
                 return jsonify({
                     'valid': False,
                     'message': 'QR code has expired. Please scan a new one.'
                 }), 400
             else:
+                print(f"❌ QR code {qr_code} is invalid")
                 return jsonify({
                     'valid': False,
                     'message': 'Invalid QR code. Please scan a valid QR code.'
@@ -420,6 +438,7 @@ def validate_qr():
         # Check if student already marked attendance with this QR
         used_by_list = qr_session.get('used_by', [])
         if student_id in used_by_list:
+            print(f"❌ Student {student_id} already used this QR")
             return jsonify({
                 'valid': False,
                 'message': 'You have already marked attendance with this QR code'
@@ -441,6 +460,7 @@ def validate_qr():
         
         if existing_attendance:
             attendance_time = existing_attendance.get('marked_at', 'Unknown time')
+            print(f"❌ Student {student_id} already marked attendance today")
             return jsonify({
                 'valid': False,
                 'message': f'You have already marked attendance today at {attendance_time.strftime("%H:%M:%S") if hasattr(attendance_time, "strftime") else attendance_time}'
@@ -491,6 +511,8 @@ def validate_qr():
         
     except Exception as e:
         print(f"❌ Unexpected error in validate_qr: {e}")
+        import traceback
+        print(f"❌ Full traceback: {traceback.format_exc()}")
         return jsonify({
             'valid': False,
             'message': f'Server error: Please try again later'
