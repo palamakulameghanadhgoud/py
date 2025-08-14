@@ -79,12 +79,13 @@ qr_generation_thread = None
 import threading
 import time
 
-KEEP_PREVIOUS_ACTIVE = os.getenv("KEEP_PREVIOUS_ACTIVE", "0") == "1"
+KEEP_PREVIOUS_ACTIVE = os.getenv("KEEP_PREVIOUS_ACTIVE", "1") == "1"
+ACCEPT_ROTATED_WITHIN_EXPIRY = os.getenv("ACCEPT_ROTATED_WITHIN_EXPIRY", "1") == "1"
 KEEP_ATTENDANCE_ON_EXPIRE = os.getenv("KEEP_ATTENDANCE_ON_EXPIRE", "1") == "1"
 ATTENDANCE_RETENTION_DAYS = int(os.getenv("ATTENDANCE_RETENTION_DAYS", "90"))
 
 def auto_generate_qr():
-    """Background thread to automatically generate new QR codes every 3 seconds"""
+    """Background thread to automatically generate new QR codes every QR_AUTO_REFRESH_INTERVAL seconds"""
     global current_qr_session
     while True:
         try:
@@ -93,41 +94,36 @@ def auto_generate_qr():
                 time.sleep(QR_AUTO_REFRESH_INTERVAL)
                 continue
 
-            if not KEEP_PREVIOUS_ACTIVE:
-                # Terminate ALL previous QR sessions immediately
-                qr_sessions_collection.update_many(
-                    {"is_active": True},
+            # Only deactivate the immediately previous session (NOT all) if we do NOT keep previous active
+            if not KEEP_PREVIOUS_ACTIVE and current_qr_session:
+                qr_sessions_collection.update_one(
+                    {"_id": current_qr_session["_id"], "is_active": True},
                     {"$set": {"is_active": False, "terminated_at": datetime.now(), "auto_terminated": True}}
                 )
-            else:
-                # Let earlier sessions naturally expire
-                pass
 
             cleanup_expired_sessions_and_data()
 
             qr_data = generate_random_data()
             qr_image = generate_qr_image(qr_data)
             if qr_image:
-                current_time = datetime.now()
-                expires_at = current_time + timedelta(seconds=QR_VALIDITY_SECONDS)
-                qr_session = {
+                now = datetime.now()
+                new_session = {
                     "qr_code": qr_data,
-                    "created_at": current_time,
-                    "expires_at": expires_at,
+                    "created_at": now,
+                    "expires_at": now + timedelta(seconds=QR_VALIDITY_SECONDS),
                     "is_active": True,
                     "used_by": [],
-                    "session_name": f"AutoSession_{current_time.strftime('%H%M%S')}",
+                    "session_name": f"AutoSession_{now.strftime('%H%M%S')}",
                     "created_by": "AUTO_GENERATOR",
-                    "auto_delete_on_expire": True,
                     "auto_generated": True,
                     "qr_image": qr_image
                 }
-                result = qr_sessions_collection.insert_one(qr_session)
-                qr_session["_id"] = result.inserted_id
-                current_qr_session = qr_session
-                print(f"🔄 NEW QR {qr_data} (valid {QR_VALIDITY_SECONDS}s) keep_prev={KEEP_PREVIOUS_ACTIVE}")
+                ins = qr_sessions_collection.insert_one(new_session)
+                new_session["_id"] = ins.inserted_id
+                current_qr_session = new_session
+                print(f"🔄 NEW QR {qr_data} valid {QR_VALIDITY_SECONDS}s keep_prev={KEEP_PREVIOUS_ACTIVE}")
         except Exception as e:
-            print(f"❌ Error in auto QR generation: {e}")
+            print(f"❌ Error in auto_generate_qr: {e}")
         time.sleep(QR_AUTO_REFRESH_INTERVAL)
 
 def start_auto_qr_generation():
@@ -403,31 +399,24 @@ def validate_qr():
         # Check if QR code exists and is valid
         current_time = datetime.now()
         try:
-            qr_session = qr_sessions_collection.find_one({
-                "qr_code": qr_code,
-                "expires_at": {"$gt": current_time},
-                "is_active": True
-            })
+            # Fetch session regardless of active flag
+            qr_session = qr_sessions_collection.find_one({"qr_code": qr_code})
         except Exception as qr_error:
             print(f"❌ Database error finding QR session: {qr_error}")
-            return jsonify({
-                'valid': False,
-                'message': 'Database error while validating QR code'
-            }), 500
-        
+            return jsonify({'valid': False,'message': 'Database error while validating QR code'}), 500
+
         if not qr_session:
-            # Check if QR exists but expired
-            expired_qr = qr_sessions_collection.find_one({"qr_code": qr_code})
-            if expired_qr:
-                return jsonify({
-                    'valid': False,
-                    'message': 'QR code has expired. Please scan a new one.'
-                }), 400
-            else:
-                return jsonify({
-                    'valid': False,
-                    'message': 'Invalid QR code. Please scan a valid QR code.'
-                }), 400
+            return jsonify({'valid': False,'message': 'Invalid QR code'}), 400
+
+        expired = qr_session['expires_at'] <= current_time
+        rotated = (not qr_session.get('is_active', True)) and not expired
+
+        if expired:
+            return jsonify({'valid': False,'message': 'QR code expired. Scan a new one.'}), 400
+
+        if rotated and not ACCEPT_ROTATED_WITHIN_EXPIRY:
+            return jsonify({'valid': False,'message': 'QR code rotated. Scan the latest QR now displayed.'}), 400
+        # If rotated but ACCEPT_ROTATED_WITHIN_EXPIRY=True, continue as valid
         
         # Check if student already marked attendance with this QR
         used_by_list = qr_session.get('used_by', [])
