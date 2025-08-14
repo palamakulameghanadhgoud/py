@@ -70,7 +70,7 @@ except Exception as e:
 
 # Configuration
 QR_VALIDITY_SECONDS = 30 # Changed from 30 to 3 seconds
-QR_AUTO_REFRESH_INTERVAL = 3  # Auto-generate new QR every 3 seconds
+QR_AUTO_REFRESH_INTERVAL = 5  # Auto-generate new QR every 3 seconds
 
 # Global variable to track current QR session
 current_qr_session = None
