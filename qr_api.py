@@ -79,12 +79,15 @@ qr_generation_thread = None
 import threading
 import time
 
-KEEP_PREVIOUS_ACTIVE = os.getenv("KEEP_PREVIOUS_ACTIVE", "0") == "1"
+KEEP_PREVIOUS_ACTIVE = os.getenv("KEEP_PREVIOUS_ACTIVE", "1") == "1"
+ACCEPT_ROTATED_WITHIN_EXPIRY = os.getenv("ACCEPT_ROTATED_WITHIN_EXPIRY", "1") == "1"
 KEEP_ATTENDANCE_ON_EXPIRE = os.getenv("KEEP_ATTENDANCE_ON_EXPIRE", "1") == "1"
 ATTENDANCE_RETENTION_DAYS = int(os.getenv("ATTENDANCE_RETENTION_DAYS", "90"))
+PURGE_SESSION_AFTER_DOWNLOAD = os.getenv("PURGE_SESSION_AFTER_DOWNLOAD", "1") == "1"
+PURGE_DELETE_SESSION_DOC = os.getenv("PURGE_DELETE_SESSION_DOC", "1") == "1"  # set to 0 to keep session metadata
 
 def auto_generate_qr():
-    """Background thread to automatically generate new QR codes every 3 seconds"""
+    """Background thread to automatically generate new QR codes every QR_AUTO_REFRESH_INTERVAL seconds"""
     global current_qr_session
     while True:
         try:
@@ -93,41 +96,36 @@ def auto_generate_qr():
                 time.sleep(QR_AUTO_REFRESH_INTERVAL)
                 continue
 
-            if not KEEP_PREVIOUS_ACTIVE:
-                # Terminate ALL previous QR sessions immediately
-                qr_sessions_collection.update_many(
-                    {"is_active": True},
+            # Only deactivate the immediately previous session (NOT all) if we do NOT keep previous active
+            if not KEEP_PREVIOUS_ACTIVE and current_qr_session:
+                qr_sessions_collection.update_one(
+                    {"_id": current_qr_session["_id"], "is_active": True},
                     {"$set": {"is_active": False, "terminated_at": datetime.now(), "auto_terminated": True}}
                 )
-            else:
-                # Let earlier sessions naturally expire
-                pass
 
             cleanup_expired_sessions_and_data()
 
             qr_data = generate_random_data()
             qr_image = generate_qr_image(qr_data)
             if qr_image:
-                current_time = datetime.now()
-                expires_at = current_time + timedelta(seconds=QR_VALIDITY_SECONDS)
-                qr_session = {
+                now = datetime.now()
+                new_session = {
                     "qr_code": qr_data,
-                    "created_at": current_time,
-                    "expires_at": expires_at,
+                    "created_at": now,
+                    "expires_at": now + timedelta(seconds=QR_VALIDITY_SECONDS),
                     "is_active": True,
                     "used_by": [],
-                    "session_name": f"AutoSession_{current_time.strftime('%H%M%S')}",
+                    "session_name": f"AutoSession_{now.strftime('%H%M%S')}",
                     "created_by": "AUTO_GENERATOR",
-                    "auto_delete_on_expire": True,
                     "auto_generated": True,
                     "qr_image": qr_image
                 }
-                result = qr_sessions_collection.insert_one(qr_session)
-                qr_session["_id"] = result.inserted_id
-                current_qr_session = qr_session
-                print(f"🔄 NEW QR {qr_data} (valid {QR_VALIDITY_SECONDS}s) keep_prev={KEEP_PREVIOUS_ACTIVE}")
+                ins = qr_sessions_collection.insert_one(new_session)
+                new_session["_id"] = ins.inserted_id
+                current_qr_session = new_session
+                print(f"🔄 NEW QR {qr_data} valid {QR_VALIDITY_SECONDS}s keep_prev={KEEP_PREVIOUS_ACTIVE}")
         except Exception as e:
-            print(f"❌ Error in auto QR generation: {e}")
+            print(f"❌ Error in auto_generate_qr: {e}")
         time.sleep(QR_AUTO_REFRESH_INTERVAL)
 
 def start_auto_qr_generation():
@@ -403,31 +401,24 @@ def validate_qr():
         # Check if QR code exists and is valid
         current_time = datetime.now()
         try:
-            qr_session = qr_sessions_collection.find_one({
-                "qr_code": qr_code,
-                "expires_at": {"$gt": current_time},
-                "is_active": True
-            })
+            # Fetch session regardless of active flag
+            qr_session = qr_sessions_collection.find_one({"qr_code": qr_code})
         except Exception as qr_error:
             print(f"❌ Database error finding QR session: {qr_error}")
-            return jsonify({
-                'valid': False,
-                'message': 'Database error while validating QR code'
-            }), 500
-        
+            return jsonify({'valid': False,'message': 'Database error while validating QR code'}), 500
+
         if not qr_session:
-            # Check if QR exists but expired
-            expired_qr = qr_sessions_collection.find_one({"qr_code": qr_code})
-            if expired_qr:
-                return jsonify({
-                    'valid': False,
-                    'message': 'QR code has expired. Please scan a new one.'
-                }), 400
-            else:
-                return jsonify({
-                    'valid': False,
-                    'message': 'Invalid QR code. Please scan a valid QR code.'
-                }), 400
+            return jsonify({'valid': False,'message': 'Invalid QR code'}), 400
+
+        expired = qr_session['expires_at'] <= current_time
+        rotated = (not qr_session.get('is_active', True)) and not expired
+
+        if expired:
+            return jsonify({'valid': False,'message': 'QR code expired. Scan a new one.'}), 400
+
+        if rotated and not ACCEPT_ROTATED_WITHIN_EXPIRY:
+            return jsonify({'valid': False,'message': 'QR code rotated. Scan the latest QR now displayed.'}), 400
+        # If rotated but ACCEPT_ROTATED_WITHIN_EXPIRY=True, continue as valid
         
         # Check if student already marked attendance with this QR
         used_by_list = qr_session.get('used_by', [])
@@ -603,59 +594,47 @@ def download_excel():
 
 @app.route('/download/session/<session_id>')
 def download_session_excel(session_id):
-    """Download attendance report for a specific QR session - triggers auto cleanup"""
+    """Download attendance report for a specific QR session - triggers auto cleanup and optional purge"""
     try:
         if not client:
             return jsonify({'error': 'Database not connected'}), 500
-        
-        # AUTO-CLEANUP: Remove expired sessions when downloading
+
         print("🗑️ Performing auto-cleanup during download...")
         cleanup_expired_sessions_and_data()
-            
-        # Find the QR session
+
         try:
-            qr_session = qr_sessions_collection.find_one({"_id": ObjectId(session_id)})
+            obj_id = ObjectId(session_id)
         except:
             return jsonify({'error': 'Invalid session ID format'}), 400
-            
+
+        qr_session = qr_sessions_collection.find_one({"_id": obj_id})
         if not qr_session:
             return jsonify({'error': 'QR session not found'}), 404
-        
-        # Get attendance records for this specific session
-        attendance_records = list(attendance_collection.find({
-            "qr_session_id": ObjectId(session_id)
-        }))
-        
+
+        attendance_records = list(attendance_collection.find({"qr_session_id": obj_id}))
         if not attendance_records:
             return jsonify({'error': 'No attendance records found for this session'}), 404
-        
-        # Prepare Excel data for this session only
-        excel_data = []
-        for record in attendance_records:
-            row = {
+
+        excel_rows = []
+        for r in attendance_records:
+            excel_rows.append({
                 'Session_ID': session_id,
-                'QR_Code': record['qr_code'],
-                'Student_ID': record['student_id'],
-                'Student_Name': record['student_name'],
-                'Department': record['department'],
-                'Year': record['year'],
-                'Attendance_Time': record['marked_at'].strftime('%Y-%m-%d %H:%M:%S'),
+                'QR_Code': r['qr_code'],
+                'Student_ID': r['student_id'],
+                'Student_Name': r['student_name'],
+                'Department': r['department'],
+                'Year': r['year'],
+                'Attendance_Time': r['marked_at'].strftime('%Y-%m-%d %H:%M:%S'),
                 'Status': 'Present',
-                'IP_Address': record.get('ip_address', ''),
-                'User_Agent': record.get('user_agent', '')[:50] + '...' if len(record.get('user_agent', '')) > 50 else record.get('user_agent', '')
-            }
-            excel_data.append(row)
-        
-        # Create DataFrame and Excel file
-        df = pd.DataFrame(excel_data)
-        
-        # Create Excel file in memory
+                'IP_Address': r.get('ip_address', ''),
+                'User_Agent': r.get('user_agent', '')[:50] + '...' if len(r.get('user_agent', '')) > 50 else r.get('user_agent', '')
+            })
+
+        df = pd.DataFrame(excel_rows)
         excel_buffer = BytesIO()
         with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
             df.to_excel(writer, sheet_name=f'Session {session_id[:8]}', index=False)
-            
-            # Add summary sheet
-            summary_data = [{
+            summary_df = pd.DataFrame([{
                 'Session_ID': session_id,
                 'QR_Code': qr_session['qr_code'],
                 'Session_Created': qr_session['created_at'].strftime('%Y-%m-%d %H:%M:%S'),
@@ -663,33 +642,37 @@ def download_session_excel(session_id):
                 'Total_Attendees': len(attendance_records),
                 'Students_Present': ', '.join([r['student_id'] for r in attendance_records]),
                 'Download_Time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'Auto_Cleanup_Performed': 'Yes'
-            }]
-            summary_df = pd.DataFrame(summary_data)
+                'Purged_After_Download': 'Yes' if PURGE_SESSION_AFTER_DOWNLOAD else 'No'
+            }])
             summary_df.to_excel(writer, sheet_name='Session Summary', index=False)
-        
+
         excel_buffer.seek(0)
-        
-        # Generate unique filename with timestamp
+
+        # Purge after preparing the file (safe; bytes already in memory)
+        if PURGE_SESSION_AFTER_DOWNLOAD:
+            del_att = attendance_collection.delete_many({"qr_session_id": obj_id}).deleted_count
+            if PURGE_DELETE_SESSION_DOC:
+                del_sess = qr_sessions_collection.delete_one({"_id": obj_id}).deleted_count
+            else:
+                qr_sessions_collection.update_one(
+                    {"_id": obj_id},
+                    {"$set": {"purged_at": datetime.now(), "attendance_purged": True}}
+                )
+                del_sess = 0
+            print(f"🧹 Purged session {session_id}: attendance_deleted={del_att}, session_deleted={del_sess}")
+
         session_time = qr_session['created_at'].strftime('%Y%m%d_%H%M%S')
         filename = f"Attendance_Session_{session_time}_{session_id[:8]}.xlsx"
-        
-        print(f"📊 Session download complete: {filename}")
-        print(f"🗑️ Expired data automatically cleaned up")
-        
+
         return send_file(
             excel_buffer,
             as_attachment=True,
             download_name=filename,
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
-        
     except Exception as e:
         print(f"❌ Error in download_session_excel: {e}")
-        return jsonify({
-            'error': str(e),
-            'message': 'Failed to generate session Excel report'
-        }), 500
+        return jsonify({'error': str(e), 'message': 'Failed to generate session Excel report'}), 500
 
 @app.route('/download/latest-session')
 def download_latest_session():
