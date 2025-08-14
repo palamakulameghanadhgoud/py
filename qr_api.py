@@ -80,6 +80,8 @@ import threading
 import time
 
 KEEP_PREVIOUS_ACTIVE = os.getenv("KEEP_PREVIOUS_ACTIVE", "0") == "1"
+KEEP_ATTENDANCE_ON_EXPIRE = os.getenv("KEEP_ATTENDANCE_ON_EXPIRE", "1") == "1"
+ATTENDANCE_RETENTION_DAYS = int(os.getenv("ATTENDANCE_RETENTION_DAYS", "90"))
 
 def auto_generate_qr():
     """Background thread to automatically generate new QR codes every 3 seconds"""
@@ -214,44 +216,60 @@ def cleanup_expired_qr_codes():
     return cleanup_expired_sessions_and_data()
 
 def cleanup_expired_sessions_and_data():
-    """Automatically remove expired sessions AND their attendance data from MongoDB"""
+    """Handle expired QR sessions. By default keep attendance; optionally purge very old data."""
     try:
         if not client:
             return 0
-            
-        current_time = datetime.now()
-        
-        # Find all expired sessions
-        expired_sessions = list(qr_sessions_collection.find({
-            "expires_at": {"$lt": current_time}
-        }))
-        
-        if not expired_sessions:
-            return 0
-        
-        expired_session_ids = [session['_id'] for session in expired_sessions]
-        expired_qr_codes = [session['qr_code'] for session in expired_sessions]
-        
-        # Delete attendance records for expired sessions
-        attendance_delete_result = attendance_collection.delete_many({
-            "qr_session_id": {"$in": expired_session_ids}
-        })
-        
-        # Delete the expired QR sessions
-        sessions_delete_result = qr_sessions_collection.delete_many({
-            "_id": {"$in": expired_session_ids}
-        })
-        
-        if sessions_delete_result.deleted_count > 0 or attendance_delete_result.deleted_count > 0:
-            print(f"🗑️ AUTO-DELETED EXPIRED DATA:")
-            print(f"   📱 Deleted {sessions_delete_result.deleted_count} expired QR sessions")
-            print(f"   📊 Deleted {attendance_delete_result.deleted_count} attendance records")
-            print(f"   🔗 QR codes auto-deleted: {expired_qr_codes}")
-        
-        return sessions_delete_result.deleted_count
-        
+
+        now = datetime.now()
+
+        # 1. Mark newly expired sessions as inactive (do not delete attendance)
+        result_mark = qr_sessions_collection.update_many(
+            {
+                "expires_at": {"$lt": now},
+                "is_active": True
+            },
+            {
+                "$set": {
+                    "is_active": False,
+                    "expired_at": now
+                }
+            }
+        )
+
+        deleted_sessions = 0
+        deleted_attendance = 0
+
+        # 2. (Optional) Hard delete sessions (and maybe attendance) older than retention window
+        retention_cutoff = now - timedelta(days=ATTENDANCE_RETENTION_DAYS)
+        old_sessions = list(qr_sessions_collection.find(
+            {"expires_at": {"$lt": retention_cutoff}}
+        ).limit(500))
+
+        if old_sessions:
+            old_session_ids = [s["_id"] for s in old_sessions]
+
+            if KEEP_ATTENDANCE_ON_EXPIRE:
+                # Only delete the old session docs; keep attendance history
+                del_sess_res = qr_sessions_collection.delete_many({"_id": {"$in": old_session_ids}})
+                deleted_sessions = del_sess_res.deleted_count
+            else:
+                # Delete both sessions and their attendance
+                del_att_res = attendance_collection.delete_many({"qr_session_id": {"$in": old_session_ids}})
+                del_sess_res = qr_sessions_collection.delete_many({"_id": {"$in": old_session_ids}})
+                deleted_sessions = del_sess_res.deleted_count
+                deleted_attendance = del_att_res.deleted_count
+
+            if deleted_sessions or deleted_attendance or result_mark.modified_count:
+                print(f"🧹 CLEANUP: expired->inactive={result_mark.modified_count}, "
+                      f"old_sessions_deleted={deleted_sessions}, "
+                      f"old_attendance_deleted={deleted_attendance}, "
+                      f"keep_attendance={KEEP_ATTENDANCE_ON_EXPIRE}")
+
+        return result_mark.modified_count + deleted_sessions
+
     except Exception as e:
-        print(f"❌ Error in auto-cleanup: {e}")
+        print(f"❌ Error in cleanup_expired_sessions_and_data: {e}")
         return 0
 
 # Health check endpoint for Render
