@@ -69,7 +69,7 @@ except Exception as e:
     client = None
 
 # Configuration
-QR_VALIDITY_SECONDS = 3  # Changed from 30 to 3 seconds
+QR_VALIDITY_SECONDS = 30 # Changed from 30 to 3 seconds
 QR_AUTO_REFRESH_INTERVAL = 3  # Auto-generate new QR every 3 seconds
 
 # Global variable to track current QR session
@@ -79,35 +79,35 @@ qr_generation_thread = None
 import threading
 import time
 
+KEEP_PREVIOUS_ACTIVE = os.getenv("KEEP_PREVIOUS_ACTIVE", "0") == "1"
+
 def auto_generate_qr():
     """Background thread to automatically generate new QR codes every 3 seconds"""
     global current_qr_session
-    
     while True:
         try:
             if not client:
                 print("❌ Database not connected, skipping auto QR generation")
                 time.sleep(QR_AUTO_REFRESH_INTERVAL)
                 continue
-            
-            # Terminate ALL previous QR sessions immediately
-            qr_sessions_collection.update_many(
-                {"is_active": True},
-                {"$set": {"is_active": False, "terminated_at": datetime.now(), "auto_terminated": True}}
-            )
-            
-            # Clean up expired sessions and their data
+
+            if not KEEP_PREVIOUS_ACTIVE:
+                # Terminate ALL previous QR sessions immediately
+                qr_sessions_collection.update_many(
+                    {"is_active": True},
+                    {"$set": {"is_active": False, "terminated_at": datetime.now(), "auto_terminated": True}}
+                )
+            else:
+                # Let earlier sessions naturally expire
+                pass
+
             cleanup_expired_sessions_and_data()
-            
-            # Generate new QR data
+
             qr_data = generate_random_data()
             qr_image = generate_qr_image(qr_data)
-            
             if qr_image:
-                # Store new QR session in MongoDB
                 current_time = datetime.now()
                 expires_at = current_time + timedelta(seconds=QR_VALIDITY_SECONDS)
-                
                 qr_session = {
                     "qr_code": qr_data,
                     "created_at": current_time,
@@ -120,18 +120,12 @@ def auto_generate_qr():
                     "auto_generated": True,
                     "qr_image": qr_image
                 }
-                
                 result = qr_sessions_collection.insert_one(qr_session)
+                qr_session["_id"] = result.inserted_id
                 current_qr_session = qr_session
-                current_qr_session['_id'] = result.inserted_id
-                
-                print(f"🔄 AUTO-GENERATED QR: {qr_data} (expires in {QR_VALIDITY_SECONDS}s)")
-                print(f"🗑️ Previous QRs terminated immediately")
-            
+                print(f"🔄 NEW QR {qr_data} (valid {QR_VALIDITY_SECONDS}s) keep_prev={KEEP_PREVIOUS_ACTIVE}")
         except Exception as e:
             print(f"❌ Error in auto QR generation: {e}")
-        
-        # Wait for next generation
         time.sleep(QR_AUTO_REFRESH_INTERVAL)
 
 def start_auto_qr_generation():
@@ -464,6 +458,7 @@ def validate_qr():
         try:
             # Insert attendance record
             attendance_result = attendance_collection.insert_one(attendance_record)
+            print(f"✅ INSERTED attendance _id={attendance_result.inserted_id} student={student_id} qr={qr_code}")
             
             # Update QR session to mark it as used by this student
             qr_sessions_collection.update_one(
@@ -484,6 +479,7 @@ def validate_qr():
             
         except Exception as insert_error:
             print(f"❌ Database error inserting attendance: {insert_error}")
+            # Add explicit failure log
             return jsonify({
                 'valid': False,
                 'message': 'Failed to save attendance record'
@@ -910,6 +906,45 @@ def qr_status():
             'error': str(e),
             'message': 'Failed to get QR status'
         }), 500
+
+# --- Debug / inspection endpoints (DO NOT expose publicly in production) ---
+@app.route('/attendance/today')
+def attendance_today():
+    if not client:
+        return jsonify({'error': 'Database not connected'}), 500
+    start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    recs = list(attendance_collection.find({"session_date": start}).sort("marked_at", 1))
+    return jsonify({
+        'count': len(recs),
+        'records': [{
+            'student_id': r['student_id'],
+            'student_name': r.get('student_name', ''),
+            'marked_at': r['marked_at'].isoformat(),
+            'qr_code': r.get('qr_code', ''),
+            'qr_session_id': str(r.get('qr_session_id'))
+        } for r in recs]
+    })
+
+@app.route('/attendance/session/<session_id>')
+def attendance_for_session(session_id):
+    if not client:
+        return jsonify({'error': 'Database not connected'}), 500
+    try:
+        sid = ObjectId(session_id)
+    except:
+        return jsonify({'error': 'Invalid session id'}), 400
+    recs = list(attendance_collection.find({"qr_session_id": sid}).sort("marked_at", 1))
+    return jsonify({
+        'session_id': session_id,
+        'count': len(recs),
+        'records': [{
+            'student_id': r['student_id'],
+            'student_name': r.get('student_name', ''),
+            'marked_at': r['marked_at'].isoformat(),
+            'qr_code': r.get('qr_code', '')
+        } for r in recs]
+    })
+# --- End debug endpoints ---
 
 if __name__ == '__main__':
     print("🚀 Starting Flask API with MongoDB Atlas...")
