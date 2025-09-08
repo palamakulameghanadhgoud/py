@@ -13,6 +13,7 @@ from pymongo import MongoClient
 from bson import ObjectId
 import json
 from dotenv import load_dotenv
+import pyotp
 
 # Load environment variables
 load_dotenv()
@@ -50,6 +51,7 @@ DATABASE_NAME = os.getenv('DATABASE_NAME', 'kl_university_attendance')
 STUDENTS_COLLECTION = os.getenv('STUDENTS_COLLECTION', 'students')
 ATTENDANCE_COLLECTION = os.getenv('ATTENDANCE_COLLECTION', 'attendance_records')
 QR_SESSIONS_COLLECTION = os.getenv('QR_SESSIONS_COLLECTION', 'qr_sessions')
+FACULTY_COLLECTION = os.getenv('FACULTY_COLLECTION', 'faculty')
 PORT = int(os.getenv('PORT', 5000))
 
 # Initialize MongoDB client
@@ -59,6 +61,7 @@ try:
     students_collection = db[STUDENTS_COLLECTION]
     attendance_collection = db[ATTENDANCE_COLLECTION]
     qr_sessions_collection = db[QR_SESSIONS_COLLECTION]
+    faculty_collection = db[FACULTY_COLLECTION]
     
     # Test connection
     client.admin.command('ping')
@@ -331,7 +334,7 @@ def get_qr():
         
     except Exception as e:
         print(f"❌ Error in get_qr: {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e)}, 500)
 
 @app.route('/validate', methods=['POST', 'OPTIONS'])
 def validate_qr():
@@ -913,6 +916,85 @@ def qr_status():
             'error': str(e),
             'message': 'Failed to get QR status'
         }), 500
+
+# --- Faculty TOTP Setup and Verification ---
+
+# Example: In production, store these in your faculty user collection in MongoDB
+FACULTY_TOTP_SECRETS = {
+    # Example: "faculty@kluniversity.edu": "BASE32SECRET"
+    # Fill this with actual secrets per faculty user
+}
+
+def generate_qr_image_from_uri(uri):
+    """Generate a QR code image (base64 PNG) from a provisioning URI."""
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(uri)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buffered = BytesIO()
+    img.save(buffered, format="PNG")
+    img_str = base64.b64encode(buffered.getvalue()).decode('utf-8')
+    return f"data:image/png;base64,{img_str}"
+
+@app.route('/faculty/totp/setup', methods=['POST'])
+def faculty_totp_setup():
+    """
+    Generate a TOTP secret and provisioning QR for a faculty user.
+    Expects JSON: { "email": "faculty@kluniversity.edu" }
+    """
+    data = request.get_json()
+    email = data.get("email")
+    if not email:
+        return jsonify({"error": "Email required"}), 400
+
+    # Check if already exists
+    faculty = faculty_collection.find_one({"email": email})
+    if faculty and "totp_secret" in faculty:
+        return jsonify({"error": "TOTP already set up for this user"}), 400
+
+    # Generate and store secret
+    secret = pyotp.random_base32()
+    faculty_collection.update_one(
+        {"email": email},
+        {"$set": {"totp_secret": secret}},
+        upsert=True
+    )
+
+    provisioning_uri = pyotp.totp.TOTP(secret).provisioning_uri(
+        name=email,
+        issuer_name="KL University"
+    )
+    qr_image = generate_qr_image_from_uri(provisioning_uri)
+    return jsonify({
+        "secret": secret,
+        "provisioning_uri": provisioning_uri,
+        "qr_image": qr_image
+    })
+
+@app.route('/faculty/totp/verify', methods=['POST'])
+def faculty_totp_verify():
+    """
+    Verify a TOTP code for a faculty user.
+    Expects JSON: { "email": "faculty@kluniversity.edu", "code": "123456" }
+    """
+    data = request.get_json()
+    email = data.get("email")
+    code = data.get("code")
+    if not email or not code:
+        return jsonify({"valid": False, "message": "Email and code required"}), 400
+
+    faculty = faculty_collection.find_one({"email": email})
+    if not faculty or "totp_secret" not in faculty:
+        return jsonify({"valid": False, "message": "No TOTP secret found for this user"}), 404
+
+    totp = pyotp.TOTP(faculty["totp_secret"])
+    is_valid = totp.verify(code)
+    return jsonify({"valid": is_valid})
 
 # --- Debug / inspection endpoints (DO NOT expose publicly in production) ---
 @app.route('/attendance/today')
