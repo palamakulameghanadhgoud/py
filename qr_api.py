@@ -1035,25 +1035,53 @@ def attendance_for_session(session_id):
     })
 # --- End debug endpoints ---
 
-if __name__ == '__main__':
-    print("🚀 Starting Flask API with MongoDB Atlas...")
-    
-    # Initialize database
-    if initialize_database():
-        print("✅ Database initialization complete")
-    else:
-        print("❌ Database initialization failed")
-    
-    # Start auto QR generation
-    start_auto_qr_generation()
-    print(f"🔄 Auto QR generation started (every {QR_AUTO_REFRESH_INTERVAL} seconds)")
-    
-    print(f"🔗 MongoDB URI: mongodb+srv://megh:***@vicecluster.4wafcsu.mongodb.net/")
-    print(f"📊 Database: {DATABASE_NAME}")
-    print(f"🌐 Starting server on port {PORT}")
-    
-    # Run Flask API
-    app.run(debug=False, port=PORT, host='0.0.0.0')
+@app.route('/sessions/start', methods=['POST'])
+def start_new_session():
+    """
+    Delete all attendance records and QR sessions, then create a new QR session.
+    This should be called by faculty to start a new session.
+    """
+    if not client:
+        return jsonify({'error': 'Database not connected'}), 500
 
-    # Start the auto QR generation in the background
-    start_auto_qr_generation()
+    # Delete all attendance records
+    deleted_attendance = attendance_collection.delete_many({}).deleted_count
+    # Delete all QR sessions
+    deleted_sessions = qr_sessions_collection.delete_many({}).deleted_count
+
+    # Create a new QR session
+    qr_data = generate_random_data()
+    qr_image = generate_qr_image(qr_data)
+    now = datetime.now()
+    new_session = {
+        "qr_code": qr_data,
+        "created_at": now,
+        "expires_at": now + timedelta(seconds=QR_VALIDITY_SECONDS),
+        "is_active": True,
+        "used_by": [],
+        "session_name": f"ManualSession_{now.strftime('%H%M%S')}",
+        "created_by": "FACULTY",
+        "auto_generated": False,
+        "qr_image": qr_image
+    }
+    ins = qr_sessions_collection.insert_one(new_session)
+    new_session["_id"] = ins.inserted_id
+
+    # Update global current_qr_session
+    global current_qr_session
+    current_qr_session = new_session
+
+    print(f"🧹 Deleted {deleted_attendance} attendance and {deleted_sessions} sessions. Started new session {new_session['_id']}.")
+
+    return jsonify({
+        'message': 'New session started. Previous attendance and sessions deleted.',
+        'deleted_attendance': deleted_attendance,
+        'deleted_sessions': deleted_sessions,
+        'new_session': {
+            'session_id': str(new_session["_id"]),
+            'qr_code': new_session["qr_code"],
+            'expires_at': new_session["expires_at"].isoformat(),
+            'created_at': new_session["created_at"].isoformat(),
+            'image': new_session.get("qr_image", "")
+        }
+    })
